@@ -7,12 +7,14 @@ from maibot_sdk.types import ErrorPolicy, HookMode
 from random import random
 from time import monotonic
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 import asyncio
 
 from ..domain.breeze_control import parse_breeze_text
 from ..domain.intonation import parse_tone_tag
 from ..domain.models import TTSError
+from ..domain.probability_delivery import batch_text, delivery_attachments, source_key, speech_text
 from ..infrastructure.voice_codec import voice_segment
 from ..services.intonation import validate_requested_direction, validate_requested_tone
 from ..services.format_correction import correct_speech_arguments
@@ -38,6 +40,21 @@ class ProbabilityVoiceState:
     reply_id: str
     text_segments: List[Dict[str, Any]]
     expires_at: float
+    source_key: str
+
+
+@dataclass
+class ProbabilityAttachmentState:
+    """语音发送成功后投递的原生附件，使用出站消息元数据独立关联。"""
+
+    stream_id: str
+    batches: List[List[Dict[str, Any]]]
+    expires_at: float
+    storage_message: bool
+    show_log: bool
+
+
+_DELIVERY_METADATA = "maimai_tts_probability_delivery"
 
 
 class ProbabilityMixin:
@@ -297,20 +314,33 @@ class ProbabilityMixin:
         scope_allowed = self.features.probability_group_enabled if group is True else (
             self.features.probability_private_enabled if group is False else False
         )
-        original_texts = [self._extract_probability_text(original["segments"]) for original, _ in pairs]
-        if not scope_allowed or any(value is None for value in original_texts):
+        if not scope_allowed:
             self.service.log.debug(
                 "跳过 LLM 回复语音转换",
                 reply_id=reply_id,
-                reason="chat_scope" if not scope_allowed else "rich_attachment",
+                reason="chat_scope",
             )
+            return {"messages": cleaned} if cleaned != messages else {}
+
+        # 概率只在正文生成后抽取一次；附件与引用限制按宿主已经拆好的每条消息处理。
+        original_texts: List[Optional[str]] = []
+        for index, (original, clean) in enumerate(pairs):
+            value = self._extract_probability_text(original["segments"])
+            explicitly_quoted = any(segment.get("type") == "reply" for segment in clean["segments"])
+            # quote_previous 是宿主的引用意图，实际引用仍在发送阶段按聊天配置确定。
+            if value is not None and not self.features.probability_quote_keep_text and explicitly_quoted:
+                self.service.log.debug("保留引用段原文", reply_id=reply_id, segment_index=index, reason="quoted_text_only")
+                value = None
+            original_texts.append(value)
+        if not any(value is not None for value in original_texts):
+            self.service.log.debug("跳过 LLM 回复语音转换", reply_id=reply_id, reason="no_convertible_text")
             return {"messages": cleaned} if cleaned != messages else {}
 
         converted = deepcopy(cleaned)
         try:
             # 整组消息共享有界等待；全部合成完成后才交回 Host，失败时整轮保留文字。
             budget = max(0, state.operation_deadline - monotonic()) if state.operation_deadline else 540
-            await asyncio.wait_for(self._convert_probability_messages(converted, original_texts), timeout=budget)
+            source_keys = await asyncio.wait_for(self._convert_probability_messages(converted, original_texts), timeout=budget)
         except (TTSError, asyncio.TimeoutError) as exc:
             error = "整轮语音合成超时" if isinstance(exc, asyncio.TimeoutError) else self._safe_error_message(exc)
             self.service.log.warning("自动语音失败，发送原文字", stream_id=session_id, reply_id=reply_id, error=error)
@@ -323,11 +353,16 @@ class ProbabilityMixin:
         )
         # Host 在回复扩展结束后才确定引用目标，因此在发送前按实际引用状态整理正文。
         # 仅登记整轮成功合成的自有音频，普通指令和其他插件的发送保持独立。
-        for original, message in zip(cleaned, converted, strict=True):
+        for index, (original, message, text_value) in enumerate(zip(cleaned, converted, original_texts, strict=True)):
+            if text_value is None:
+                continue
             voice = next(segment for segment in message["segments"] if segment["type"] == "voice")
             key = (session_id, voice["hash"], voice["data"])
             self._probability_voice_states.setdefault(key, []).append(ProbabilityVoiceState(
-                reply_id=reply_id, text_segments=original["segments"], expires_at=monotonic() + 600,
+                reply_id=reply_id,
+                text_segments=deepcopy([segment for segment in original["segments"] if segment.get("type") == "text"]),
+                expires_at=monotonic() + 600,
+                source_key=source_keys[index],
             ))
         return {"messages": converted}
 
@@ -352,91 +387,126 @@ class ProbabilityMixin:
         key = (message.get("session_id"), voice.get("hash"), voice.get("data"))
         if not all(isinstance(value, str) for value in key):
             return {"action": "continue"}
+        if key not in self._probability_voice_states:
+            return {"action": "continue"}
+        incoming = await asyncio.to_thread(source_key, segments)
         self._remove_expired_probability_states()
         pending = self._probability_voice_states.get(key)
         if not pending:
             return {"action": "continue"}
-        state = pending.pop(0)
+        index = next((index for index, state in enumerate(pending) if state.source_key == incoming), None)
+        if index is None:
+            return {"action": "continue"}
+        state = pending.pop(index)
         if not pending:
             del self._probability_voice_states[key]
         quoted = set_reply or any(
             isinstance(segment, dict) and segment.get("type") == "reply" for segment in segments
         )
-        if not quoted and not self.features.probability_keep_text:
-            return {"action": "continue"}
-
         keep_voice = not quoted or self.features.probability_quote_keep_text
-        has_text = any(
-            isinstance(segment, dict) and segment.get("type") == "text"
-            and isinstance(segment.get("data"), str) and segment["data"].strip() for segment in segments
-        )
-        arranged: List[Dict[str, Any]] = []
-        for segment in segments:
-            if segment is voice:
-                if not has_text:
-                    arranged.extend(deepcopy(state.text_segments))
-            else:
-                arranged.append(deepcopy(segment))
-        if keep_voice:
-            # 先消费自有音频状态，独立文字发送再次触发本 Hook 时不会递归转换。
-            # 引用卡片随文字发送；原语音继续使用 Host 已确定的路由与被动回复上下文。
-            if set_reply and not any(segment.get("type") == "reply" for segment in arranged):
+        if not keep_voice:
+            # 自动引用与 quote_previous 由宿主稍后判定，沿用原来只发送引用正文的处理。
+            arranged = [deepcopy(segment) for segment in segments if segment is not voice]
+            if not any(segment.get("type") == "text" for segment in arranged):
+                arranged.extend(deepcopy(state.text_segments))
+            return {"action": "continue", "modified_kwargs": dict(
+                kwargs, message=dict(message, raw_message=arranged, processed_plain_text=""), set_reply=set_reply,
+            )}
+
+        before, after = delivery_attachments(segments)
+        if quoted or self.features.probability_keep_text:
+            arranged = deepcopy([segment for segment in segments if segment.get("type") == "text"])
+            if not arranged:
+                arranged = deepcopy(state.text_segments)
+            references = [deepcopy(segment) for segment in segments if segment.get("type") == "reply"]
+            if set_reply and not references:
                 target = kwargs.get("reply_message_id")
                 if not isinstance(target, str) or not target:
                     raise TTSError("引用语音回复缺少被引用消息 ID")
-                arranged.insert(0, {"type": "reply", "data": {"target_message_id": target}})
-            display_text = "".join(segment["data"] for segment in arranged if segment.get("type") == "text")
+                references = [{"type": "reply", "data": {"target_message_id": target}}]
+            before.append(references + arranged)
+        # 自有音频状态已消费，附件与正文独立发送不会再次转换；语音保持宿主原始发送上下文。
+        for batch in before:
             await self._send_tts_message(
-                arranged, key[0], display_text,
+                batch, key[0], batch_text(batch),
                 storage_message=kwargs.get("storage_message", True),
                 show_log=kwargs.get("show_log", True),
             )
-            arranged = [deepcopy(voice)]
-            set_reply = False
-        updated = dict(message, raw_message=arranged, processed_plain_text="")
+        updated = dict(message, raw_message=[deepcopy(voice)], processed_plain_text=voice["data"],
+                       is_at=False, is_emoji=False, is_picture=False)
+        if after:
+            token = uuid4().hex
+            info = deepcopy(message.get("message_info", {}))
+            additional = dict(info.get("additional_config") or {})
+            additional[_DELIVERY_METADATA] = token
+            info["additional_config"] = additional
+            updated["message_info"] = info
+            self._probability_attachment_states[token] = ProbabilityAttachmentState(
+                key[0], after, monotonic() + 600,
+                kwargs.get("storage_message", True), kwargs.get("show_log", True),
+            )
         # reply_to 仍是 QQ 官方被动回复的发送上下文；原语音的目标和路由字段沿用宿主消息。
         self.service.log.debug(
             "已整理概率语音回复", stream_id=key[0], reply_id=state.reply_id,
-            mode="text_and_voice" if keep_voice else "text_only",
+            mode="text_and_voice" if quoted or self.features.probability_keep_text else "voice_only",
         )
-        return {"action": "continue", "modified_kwargs": dict(kwargs, message=updated, set_reply=set_reply)}
+        return {"action": "continue", "modified_kwargs": dict(kwargs, message=updated, set_reply=False)}
+
+    @HookHandler(
+        "send_service.after_send", name="send_probability_reply_attachments",
+        description="语音成功后继续发送同段原有的提及与表情，字段与顺序保持一致",
+        mode=HookMode.BLOCKING, timeout_ms=45000,
+    )
+    async def send_probability_reply_attachments(
+        self, message: Optional[Dict[str, Any]] = None, sent: bool = False, **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        if not isinstance(message, dict):
+            return {"action": "continue"}
+        info = message.get("message_info", {})
+        additional = info.get("additional_config", {}) if isinstance(info, dict) else {}
+        token = additional.get(_DELIVERY_METADATA) if isinstance(additional, dict) else None
+        if not isinstance(token, str):
+            return {"action": "continue"}
+        self._remove_expired_probability_states()
+        state = self._probability_attachment_states.pop(token, None)
+        if state is None or state.stream_id != message.get("session_id") or not sent:
+            return {"action": "continue"}
+        for batch in state.batches:
+            await self._send_tts_message(
+                batch, state.stream_id, batch_text(batch),
+                storage_message=state.storage_message, show_log=state.show_log,
+            )
+        return {"action": "continue"}
 
     async def _convert_probability_messages(
         self, messages: List[Dict[str, Any]], original_texts: List[Optional[str]]
-    ) -> None:
-        keep_text = self.features.probability_keep_text
+    ) -> Dict[int, str]:
+        """合成目标正文并计算附件身份，全部完成后由调用方一次登记发送状态。"""
+        source_keys: Dict[int, str] = {}
         adapter = None
         if self.features.probability_tone_enabled:
             adapter = ProbabilityToneAdapter(
                 self.ctx, self.features, "\n".join(value for value in original_texts if value is not None), self.service.log
             )
-        for message, original in zip(messages, original_texts, strict=True):
+        for index, (message, original) in enumerate(zip(messages, original_texts, strict=True)):
             if original is None:
-                raise TTSError("概率语音只处理纯文本回复")
+                continue
             options: Dict[str, Any] = {"tone_adapter": adapter} if adapter is not None else {}
             audio = await self._synthesize_audio(text=original, **options)
             # voice 的 data 是已知朗读正文，二进制由独立字段传递；Host 据此记录语音内容。
             display_text = audio.display_text if audio.display_text is not None else parse_tone_tag(original).text
             segment = await asyncio.to_thread(voice_segment, audio, display_text)
-            if keep_text:
-                message["segments"].append(segment)
-            else:
-                message["segments"] = [segment]
+            source_keys[index] = await asyncio.to_thread(source_key, message["segments"])
+            # 正文暂留在宿主分段中，供宿主决定首段引用；发送 Hook 再拆为独立文字与语音。
+            message["segments"].append(segment)
+        return source_keys
 
     @staticmethod
     def _extract_probability_text(segments: Any) -> Optional[str]:
         if not isinstance(segments, list) or not segments:
             return None
-        texts: List[str] = []
-        for segment in segments:
-            if (
-                not isinstance(segment, dict)
-                or segment.get("type") != "text"
-                or not isinstance(segment.get("data"), str)
-            ):
-                return None
-            texts.append(segment["data"])
-        return "".join(texts).strip() or None
+        return speech_text(segments)
 
     @staticmethod
     def _clean_probability_messages(messages: List[Dict[str, Any]], *, breeze: bool = False) -> List[Dict[str, Any]]:
@@ -481,15 +551,16 @@ class ProbabilityMixin:
 
     @staticmethod
     def _has_rich_reply_attachment(arguments: Any) -> bool:
-        return isinstance(arguments, dict) and any(
-            arguments.get(key) for key in ("attach_pic", "attach_emoji", "attach_at")
-        )
+        return isinstance(arguments, dict) and bool(arguments.get("attach_pic"))
 
     def _remove_expired_probability_states(self) -> None:
         now = monotonic()
         expired = [key for key, value in self._probability_reply_states.items() if value.expires_at <= now]
         for key in expired:
             del self._probability_reply_states[key]
+        expired_attachments = [key for key, value in self._probability_attachment_states.items() if value.expires_at <= now]
+        for key in expired_attachments:
+            del self._probability_attachment_states[key]
         for key, states in list(self._probability_voice_states.items()):
             active = [state for state in states if state.expires_at > now]
             if active:

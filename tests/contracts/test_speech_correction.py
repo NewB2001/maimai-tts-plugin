@@ -29,6 +29,7 @@ class ReplyBot(PromptBot, ProbabilityMixin):
         self.ctx.send.text = AsyncMock(return_value=True)
         self._probability_reply_states = {}
         self._probability_voice_states = {}
+        self._probability_attachment_states = {}
         self._probability_reply_available_sessions = set()
 
 
@@ -99,7 +100,7 @@ async def test_normal_reply_repair_then_probability_conversion(serve, service):
         "before_send", "reply-1", session_id="test-stream", chat={"is_group_chat": False},
         messages=[{"segments": [{"type": "text", "data": response}]}],
     )
-    assert result["messages"][0]["segments"][0]["type"] == "voice" and len(calls) == 1
+    assert [part["type"] for part in result["messages"][0]["segments"]] == ["text", "voice"] and len(calls) == 1
     assert bot.ctx.call_capability.await_count == 1
 
 
