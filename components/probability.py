@@ -158,6 +158,7 @@ class ProbabilityMixin:
     ) -> Dict[str, Any]:
         del hook_name
         started = monotonic()
+        original_response = response
         parsed = parse_tone_tag(response)
         reply_id = reply_tool_args.get("_reply_id", "") if isinstance(reply_tool_args, dict) else ""
         targeted = self._is_probability_reply(reply_tool_args) and isinstance(reply_id, str) and bool(reply_id)
@@ -250,13 +251,13 @@ class ProbabilityMixin:
             reason=reason,
             probability=self.features.probability,
         )
-        if not parsed.tagged and not breeze_controls:
+        if not parsed.tagged and not breeze_controls and response == original_response:
             return {"action": "continue"}
         modified = dict(kwargs, session_id=session_id, reply_tool_args=reply_tool_args)
         if not should_convert and not display_text.strip():
             return {"action": "abort", "custom_result": {"reason": tag_error or "控制标记后缺少可见正文"}}
         modified["response"] = response if should_convert else display_text
-        if should_convert:
+        if should_convert and (parsed.tagged or breeze_controls):
             # 语调与局部事件随这一条回复交给扩展；正文保持完整，避免拆分或错字处理损坏控制标签。
             modified["skip_post_process"] = True
         return {"action": "continue", "modified_kwargs": modified}

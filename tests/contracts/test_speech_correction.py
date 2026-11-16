@@ -105,6 +105,24 @@ async def test_normal_reply_repair_then_probability_conversion(serve, service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("probability", [0, 1])
+async def test_normal_reply_repair_to_plain_text_reaches_host_and_tts(serve, service, probability):
+    bot, calls, _ = await setup_bot(serve, service)
+    service.store._config.feature.probability = probability
+    bot.ctx.call_capability.return_value = {"success": True, "response": json.dumps({"text": TEXT})}
+    prepared = await prepare_reply(bot, "[mmtts:unknown]" + TEXT)
+    assert prepared["modified_kwargs"]["response"] == TEXT
+    assert "skip_post_process" not in prepared["modified_kwargs"]
+    messages = [{"segments": [{"type": "text", "data": prepared["modified_kwargs"]["response"]}], "quote_previous": False}]
+    result = await bot.handle_probability_tts(
+        "before_send", "reply-1", session_id="test-stream", chat={"is_group_chat": False}, messages=messages,
+    )
+    parts = result.get("messages", messages)[0]["segments"]
+    assert [part["type"] for part in parts] == (["text", "voice"] if probability else ["text"])
+    assert len(calls) == probability and bot.ctx.call_capability.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_normal_reply_repair_failure_and_empty_controls_stay_out_of_chat(serve, service):
     bot, calls, _ = await setup_bot(serve, service)
     bot.ctx.call_capability.return_value = {"success": True, "response": '{}'}
