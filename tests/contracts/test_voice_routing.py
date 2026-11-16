@@ -5,7 +5,7 @@ from typing import Optional
 
 import pytest
 
-from maimai_tts_contract.domain.models import Profile, RouteTarget, StudioConfig, TTSError
+from maimai_tts_contract.domain.models import Profile, RouteTarget, StudioConfig, TTSError, Voice
 from maimai_tts_contract.services.studio import Studio
 
 
@@ -180,3 +180,33 @@ async def test_missing_model_preview_voice_reports_its_id_without_poisoning_rout
         assert calls == ["voice-default", "voice-override"]
     finally:
         await studio.close()
+
+
+@pytest.mark.parametrize("kind", CASES)
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_model_voice_settings_override_shared_voice_independent_of_order(serve, service, kind, reverse):
+    calls = []
+    saved = config(await serve(upstream(kind, calls)), kind, None)
+    root = saved.profiles[0]
+    generic = Voice(id=CASES[kind][1], name="通用音色", speed=0.9,
+                    instructions=None if kind == "minimax" else "轻柔")
+    scoped = Voice(id=generic.id, name="模型专属音色", model=root.model, speed=1.4,
+                   instructions=None if kind == "minimax" else "坚定",
+                   tone={"mode": "fixed", "emotion": "happy"})
+    root.voices = [scoped, generic] if reverse else [generic, scoped]
+    before = saved.model_dump()
+    actual = root.for_model(root.model).with_selected_voice()
+    assert actual.speed == 1.4 and actual.tone.emotion == "happy"
+    if kind != "minimax":
+        assert actual.instructions == "坚定"
+    await service.synthesize("模型专属配置。", config=saved)
+    assert calls == [generic.id] and saved.model_dump() == before
+
+
+async def test_model_specific_training_voice_is_not_hidden_by_ready_shared_voice():
+    saved = config("https://example.test", "openai", None)
+    root = saved.profiles[0]
+    root.voices = [Voice(id="alloy", name="通用音色"),
+                   Voice(id="alloy", name="当前模型训练中", model=root.model, clone_state="training")]
+    with pytest.raises(TTSError, match="正在训练"):
+        root.for_model(root.model).with_selected_voice()

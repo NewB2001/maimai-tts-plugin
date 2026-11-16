@@ -357,7 +357,7 @@ class Profile(Model):
         resolved = self._platform_instructions is not None
         current_options = self.options if resolved or current_parameters is None else current_parameters.options
         current_tone = self.tone if resolved or current_parameters is None else current_parameters.tone
-        selected_voice = next((v for v in self.voices if v.id == self.voice and v.model in ("", self.model)), None)
+        selected_voice = self.voice_for_model(self.voice)
         effective_tone = (
             selected_voice.tone if selected_voice is not None and selected_voice.tone is not None else current_tone
         )
@@ -403,7 +403,7 @@ class Profile(Model):
         for item in self.models:
             if item.parameters is not None:
                 parameters = item.parameters
-                voice_settings = next((v for v in self.voices if v.id == item.voice and v.model in ("", item.id)), None)
+                voice_settings = self.voice_for_model(item.voice, item.id)
                 policy = (
                     voice_settings.tone
                     if voice_settings is not None and voice_settings.tone is not None
@@ -599,7 +599,7 @@ class Profile(Model):
         model = next((item for item in self.models if item.id == model_id), None)
         parameters = model.parameters if model is not None else None
         options = parameters.options if parameters is not None else self.options
-        voice = next((item for item in self.voices if item.id == voice_id and item.model in ("", model_id)), None)
+        voice = self.voice_for_model(voice_id, model_id)
         resource = voice.resource_id if voice is not None and voice.resource_id else options.resource_id
         parent = (
             self.platform_instructions
@@ -641,8 +641,22 @@ class Profile(Model):
             data["endpoint"] = urlunsplit(parsed._replace(query=urlencode(query)))
         return self._runtime_profile(data)
 
+    def voices_for_model(self, model_id: Optional[str] = None) -> List[Voice]:
+        """返回模型实际可用的收藏，同 ID 的模型专属配置覆盖通用配置。"""
+        target = self.model if model_id is None else model_id
+        selected: Dict[str, Voice] = {}
+        for scope in ("", target):
+            for voice in self.voices:
+                if voice.model == scope:
+                    selected[voice.id] = voice
+        return list(selected.values())
+
+    def voice_for_model(self, voice_id: str, model_id: Optional[str] = None) -> Optional[Voice]:
+        """按音色 ID 读取当前模型生效的收藏配置。"""
+        return next((voice for voice in self.voices_for_model(model_id) if voice.id == voice_id), None)
+
     def resolve_voice_id(self, value: str) -> str:
-        voices = [item for item in self.voices if item.model in ("", self.model)]
+        voices = self.voices_for_model()
         if any(item.id == value for item in voices):
             return value
         matches = [item.id for item in voices if item.name == value]
@@ -653,9 +667,7 @@ class Profile(Model):
     def with_selected_voice(self) -> "Profile":
         if self._platform_instructions is None and self.model:
             return self.for_model(self.model).with_selected_voice()
-        selected = next(
-            (item for item in self.voices if item.id == self.voice and item.model in ("", self.model)), None
-        )
+        selected = self.voice_for_model(self.voice)
         if selected is None:
             if self.kind == "breeze" and self.options.breeze_api_mode == "self_hosted" and self.voice:
                 data = self.model_dump()

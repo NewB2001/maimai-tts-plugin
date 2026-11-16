@@ -659,3 +659,25 @@ async def test_voice_catalog_is_available_while_default_voice_is_training(serve,
         bot.ctx.call_capability.assert_not_awaited()
     finally:
         await api.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_saved_voice_catalog_and_request_use_model_specific_settings(serve, service, reverse):
+    api, calls, _ = await setup_api(serve, service)
+    root = service.store._config.profiles[0]
+    shared = Voice(id=root.voice, name="通用音色", instructions="通用语气", speed=0.9)
+    scoped = Voice(id=root.voice, name="模型专属音色", model=root.model, instructions="模型语气", speed=1.4)
+    root.voices = [scoped, shared] if reverse else [shared, scoped]
+    try:
+        catalog = await api.call("voices", source="saved")
+        assert catalog["ok"] and catalog["data"]["voices"] == [
+            {"id": root.voice, "name": scoped.name, "model_id": root.model, "state": "ready"},
+        ]
+        description = await api.call("describe")
+        assert description["data"]["parameters"]["properties"]["speed"]["default"] == 1.4
+        result = await api.call("advanced", text=TEXT)
+        assert result["ok"] and len(calls) == 1
+        assert calls[0]["instructions"] == scoped.instructions and calls[0]["speed"] == 1.4
+    finally:
+        await api.close()

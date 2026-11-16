@@ -2763,13 +2763,25 @@
         emotion: "neutral",
         allowed: [],
       });
+      function savedModelVoices(p, model = p.model) {
+        const voices = new Map();
+        for (const scope of ["", model]) {
+          for (const voice of p.voices) {
+            if ((voice.model || "") === scope) voices.set(voice.id, voice);
+          }
+        }
+        return [...voices.values()];
+      }
+      function savedModelVoice(p, id, model = p.model) {
+        return savedModelVoices(p, model).find((voice) => voice.id === id);
+      }
       function toneCapability(
         p,
         voice = p.voice,
         resource,
       ) {
         if (resource === undefined) {
-          const saved = p.voices.find((item) => item.id === voice && (!item.model || item.model === p.model));
+          const saved = savedModelVoice(p, voice);
           resource = saved?.resource_id || p.options.resource_id;
         }
         return state.intonation.rules.find(
@@ -3041,10 +3053,8 @@
         if (!["preset", "account"].includes(category)) {
           state.voiceEditor = panel.drafts[workspaceCacheKey()] || null;
           if (state.voiceEditor?.sourceId) {
-            const index = state.modelEditor.profile.voices.findIndex(
-              (v) =>
-                v.id === state.voiceEditor.sourceId &&
-                (!v.model || v.model === target),
+            const index = state.modelEditor.profile.voices.indexOf(
+              savedModelVoice(state.modelEditor.profile, state.voiceEditor.sourceId, target),
             );
             state.voiceEditor.index = index < 0 ? undefined : index;
           }
@@ -3501,9 +3511,7 @@
                     : true;
             return true;
           }),
-          voices = p.voices
-            .map((v, index) => ({ ...v, index }))
-            .filter((v) => !v.model || v.model === p.model),
+          voices = savedModelVoices(p).map((v) => ({ ...v, index: p.voices.indexOf(v) })),
           account = isAccountClone(),
           listMode = ["preset", "account"].includes(category),
           hints = {
@@ -3609,7 +3617,7 @@
         };
         if (state.voiceEditor && includeVoice) {
           const v = preparedVoice();
-          if (state.voiceEditor.index === undefined) p.voices.push(v);
+          if (state.voiceEditor.index === undefined || !p.voices[state.voiceEditor.index].model) p.voices.push(v);
           else p.voices[state.voiceEditor.index] = v;
           p.voice = v.id;
           m.voice = v.id;
@@ -3647,7 +3655,7 @@
           )
         )
           throw Error("此模型已收藏相同的音色 ID。");
-        if (editor.index === undefined) {
+        if (editor.index === undefined || !old.model) {
           if (p.voices.length >= 100)
             throw Error("每个平台最多收藏 100 个音色。");
           p.voices.push(v);
@@ -3699,7 +3707,7 @@
             (v) =>
               !v.model || v.model === editor.originalId || v.model === p.model,
           )
-          .map((v) => ({ ...v, model: id }));
+          .map((v) => v.model ? { ...v, model: id } : v);
         base.voices = [
           ...base.voices.filter(
             (v) => v.model && v.model !== editor.originalId,
@@ -3980,8 +3988,7 @@
           (v) => (v.model && v.model !== p.model) || !ids.has(v.id),
         );
         const oldVoices = new Map(
-          p.voices
-            .filter((v) => !v.model || v.model === p.model)
+          savedModelVoices(p)
             .map((v) => [v.id, v]),
         );
         const additions = values
@@ -4046,10 +4053,7 @@
           id = state.voiceModels[p.id] || p.model,
           item = p.models?.find((m) => m.id === id);
         const result = item ? modelProfile(p, item) : { ...p, options: { ...p.options } };
-        const selected = p.voices.find(
-          (v) =>
-            v.id === result.voice && (!v.model || v.model === result.model),
-        );
+        const selected = savedModelVoice(p, result.voice, result.model);
         if (selected?.reference) {
           const ref = selected.reference;
           result.options.reference_source = ref.source;
@@ -4079,17 +4083,14 @@
         p.options.reference_source = "file";
         p.options.reference_file = path;
         const scoped = voiceTarget();
-        const selected = p.voices.find(
-          (v) =>
-            v.id === scoped.voice && (!v.model || v.model === scoped.model),
-        );
+        const selected = savedModelVoice(p, scoped.voice, scoped.model);
         if (selected?.reference) {
           selected.reference.source = "file";
           selected.reference.path = path;
         }
       }
       function modelLibrary(p) {
-        const rows = p.models.map((m) => `<div class="model-row"><div class="model-copy"><strong>${h(m.name || m.id)}</strong>${m.name ? `<small>${h(m.id)}</small>` : ""}<small>${p.voices.filter((v) => !v.model || v.model === m.id).length} 个音色</small></div><div class="model-row-actions"><button class="maibot-button key small" data-edit-model="${h(m.id)}">模型设置</button><button class="maibot-button maibot-button-primary key small" data-open-voices="${h(m.id)}">音色与克隆</button><button class="maibot-button key small danger flat" data-remove-model="${h(m.id)}" aria-label="移除模型 ${h(m.name || m.id)}">移除模型</button></div></div>`).join("");
+        const rows = p.models.map((m) => `<div class="model-row"><div class="model-copy"><strong>${h(m.name || m.id)}</strong>${m.name ? `<small>${h(m.id)}</small>` : ""}<small>${savedModelVoices(p, m.id).length} 个音色</small></div><div class="model-row-actions"><button class="maibot-button key small" data-edit-model="${h(m.id)}">模型设置</button><button class="maibot-button maibot-button-primary key small" data-open-voices="${h(m.id)}">音色与克隆</button><button class="maibot-button key small danger flat" data-remove-model="${h(m.id)}" aria-label="移除模型 ${h(m.name || m.id)}">移除模型</button></div></div>`).join("");
         return `<hr class="split"><div class="section-title"><div><h3>模型与音色</h3><small>模型参数和声音资源分别管理，保存后即可使用。</small></div><button class="maibot-button key small" data-action="manage-models">添加 / 管理模型</button></div><div class="model-library">${rows || '<p class="choice-empty">点击“添加 / 管理模型”配置声音来源。</p>'}</div>`;
       }
       async function removeConfiguredModel(id) {
@@ -4123,7 +4124,9 @@
       async function removeWorkspaceVoice(index) {
         const p = state.modelEditor.profile, voice = p.voices[index], panel = state.voiceWorkspace;
         if (!voice) throw Error("音色已移出收藏，请刷新后选择。");
-        const affected = new Set(voice.model ? [voice.model] : p.models.map((m) => m.id));
+        const affected = new Set(voice.model ? [voice.model] : p.models.filter(
+          (m) => savedModelVoice(p, voice.id, m.id) === voice,
+        ).map((m) => m.id));
         if ([state.config.primary, ...state.config.fallbacks].filter(Boolean).some((target) => {
           if (target.provider_id !== p.id || !affected.has(target.model_id || p.model)) return false;
           const selected = p.models.find((m) => m.id === (target.model_id || p.model));
@@ -4144,7 +4147,7 @@
         }
         const editor = state.voiceEditor;
         if (editor?.sourceId === voice.id) state.voiceEditor = null;
-        else if (editor?.sourceId) editor.index = p.voices.findIndex((v) => v.id === editor.sourceId && (!v.model || v.model === p.model));
+        else if (editor?.sourceId) editor.index = p.voices.indexOf(savedModelVoice(p, editor.sourceId));
         if (!state.voiceEditor && !["preset", "account"].includes(panel.category)) initVoiceDraft();
         if (await persistVoiceWorkspace()) notify("音色收藏已移除并保存。");
       }
@@ -4212,8 +4215,7 @@
         remoteVoiceEntries(p)
           .filter((v) => !v.model || v.model === p.model)
           .forEach((v) => values.set(v.id, { ...v, model: p.model }));
-        p.voices
-          .filter((v) => !v.model || v.model === p.model)
+        savedModelVoices(p)
           .forEach((v) => values.set(v.id, v));
         if (p.voice && !values.has(p.voice))
           values.set(p.voice, { id: p.voice, name: p.voice, model: p.model });
@@ -4880,7 +4882,7 @@
             continue;
           }
           const p = modelProfile(root, model), id = route.voice?.trim() || p.voice,
-            voice = root.voices.find((v) => v.id === id && (!v.model || v.model === model.id)),
+            voice = savedModelVoice(root, id, model.id),
             cap = toneCapability(p, id, voice?.resource_id || p.options.resource_id),
             label = `${root.name} / ${model.name || model.id}${voice ? " / " + voice.name : id ? " / " + id : ""}`;
           if (!cap || (p.kind === "compatible" && protocolFor(p).mode === "custom" && !supportsVoiceStyle(p, id))) {
@@ -6308,10 +6310,7 @@
         }
         if (key.startsWith("options.reference_")) {
           const scoped = state.subtab === "voices" ? voiceTarget() : current(),
-            selected = editingProfile().voices.find(
-              (v) =>
-                v.id === scoped.voice && (!v.model || v.model === scoped.model),
-            );
+            selected = savedModelVoice(editingProfile(), scoped.voice, scoped.model);
           if (selected?.reference) {
             const ref = selected.reference,
               field = parts.at(-1);

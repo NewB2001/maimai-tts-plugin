@@ -288,7 +288,7 @@ class PluginAPIService:
             voices = [{"id": voice, "name": details.get(voice, {}).get("name", voice), "model_id": profile.model} for voice in values]
         elif source == "saved":
             voices = [{"id": voice.id, "name": voice.name, "model_id": voice.model, "state": voice.clone_state}
-                      for voice in profile.voices if voice.model in ("", profile.model)]
+                      for voice in profile.voices_for_model()]
             if profile.voice and all(voice["id"] != profile.voice for voice in voices):
                 voices.insert(0, {"id": profile.voice, "name": profile.voice, "model_id": profile.model, "state": "ready"})
         else:
