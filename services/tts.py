@@ -87,6 +87,18 @@ def strip_stage_directions(text: str) -> str:
     return cleaned or text
 
 
+def spoken_text_of(raw_text: str, *, strip: bool) -> str:
+    """合成链路唯一的朗读正文。
+
+    语调 LLM 生成事件锚点、校验锚点、插入锚点都必须基于同一份文本，
+    否则清洗前后的锚点会错位（丢失事件或判定为重复锚点而报错）。
+    调用方与 :meth:`TTSService.synthesize` 共用此函数，原文仍用于显示与语气参考。
+    """
+    parsed = parse_tone_tag(raw_text.strip())
+    base = parsed.text if not parsed.error else raw_text.strip()
+    return strip_stage_directions(base) if strip else base
+
+
 T = TypeVar("T")
 
 
@@ -290,6 +302,7 @@ class TTSService:
         tone_adapter: Optional[ToneAdapter] = None,
         profile_transform: Optional[Callable[[Profile], Profile]] = None,
     ) -> Audio:
+        raw_text = text
         if not isinstance(text, str) or not text.strip():
             raise TTSError("待合成文本不能为空")
         if delivery_format not in {None, "silk", "source"}:
@@ -305,7 +318,8 @@ class TTSService:
         if config is None:
             config = self.store.config
         # 括号里的环境与动作描写只属于文字消息：开启后朗读时剔除，文字消息仍保留原样。
-        spoken_text = strip_stage_directions(text) if config.feature.strip_stage_directions else text
+        # 语调适配器与这里共用 spoken_text_of，保证事件锚点基于同一份最终朗读文本。
+        spoken_text = spoken_text_of(raw_text, strip=config.feature.strip_stage_directions)
         profiles = {profile.id: profile for profile in config.profiles}
         if profile_id:
             profile = profiles.get(profile_id)
